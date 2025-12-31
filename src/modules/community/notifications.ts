@@ -14,6 +14,7 @@ export enum NotificationType {
   REACTION = 'reaction',
   POST_APPROVED = 'post_approved',
   POST_REJECTED = 'post_rejected',
+  POST_CREATED = 'post_created',
   GROUP_INVITE = 'group_invite',
   GROUP_JOIN_REQUEST = 'group_join_request',
   MODERATION_ACTION = 'moderation_action',
@@ -220,61 +221,68 @@ export class NotificationService {
 // ===== API ENDPOINTS =====
 
 // Get user notifications
-router.get('/notifications', async (req, res, next) => {
+router.get('/notifications', requireAuth, async (req, res, next) => {
   try {
-    const userId = req.headers['x-user-id'] as string;
+    const userId = req.user?.id;
+    const { page = 1, limit = 20, unreadOnly = false } = req.query;
     
     if (!userId) {
       return res.status(401).json({
         success: false,
-        error: 'User authentication required'
+        error: 'Authentication required'
       });
     }
 
-    // Mock notifications for now
-    const mockNotifications = [
-      {
-        id: '1',
-        type: 'reaction',
-        title: 'Neuer Like',
-        message: 'Max Mustermann hat deinen Post "Meine ersten Erfahrungen" geliked',
-        isRead: false,
-        createdAt: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(), // 2 hours ago
-        data: { postId: '1', userId: '1' }
-      },
-      {
-        id: '2',
-        type: 'reply',
-        title: 'Neuer Kommentar',
-        message: 'Anna Schmidt hat deinen Post kommentiert: "Sehr hilfreiche Tipps!"',
-        isRead: false,
-        createdAt: new Date(Date.now() - 5 * 60 * 60 * 1000).toISOString(), // 5 hours ago
-        data: { postId: '2', commentId: '1' }
-      },
-      {
-        id: '3',
-        type: 'mention',
-        title: 'Erwähnung',
-        message: 'Dr. Thomas Weber hat dich in einem Post erwähnt',
-        isRead: true,
-        createdAt: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(), // 1 day ago
-        data: { postId: '3' }
-      },
-      {
-        id: '4',
-        type: 'system_announcement',
-        title: 'Willkommen in der Community!',
-        message: 'Vielen Dank für deine Registrierung. Teile deine Erfahrungen mit anderen!',
-        isRead: true,
-        createdAt: new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString(), // 3 days ago
-        data: {}
-      }
-    ];
+    const skip = (Number(page) - 1) * Number(limit);
+
+    // Build where clause
+    const where: any = {
+      userId
+    };
+
+    if (unreadOnly === 'true') {
+      where.readAt = null;
+    }
+
+    // Get notifications from database
+    const [notifications, total, unreadCount] = await Promise.all([
+      prisma.notification.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        skip,
+        take: Number(limit)
+      }),
+      prisma.notification.count({ where }),
+      prisma.notification.count({
+        where: {
+          userId,
+          readAt: null
+        }
+      })
+    ]);
+
+    // Transform notifications to match expected format
+    const transformedNotifications = notifications.map(notification => ({
+      id: notification.id,
+      type: notification.type,
+      title: notification.title,
+      message: notification.message,
+      isRead: notification.readAt !== null,
+      createdAt: notification.createdAt.toISOString(),
+      data: (notification.metadata as any)?.data || {},
+      actionUrl: (notification.metadata as any)?.actionUrl
+    }));
 
     res.json({
       success: true,
-      notifications: mockNotifications,
-      unreadCount: mockNotifications.filter(n => !n.isRead).length
+      notifications: transformedNotifications,
+      unreadCount,
+      pagination: {
+        page: Number(page),
+        limit: Number(limit),
+        total,
+        pages: Math.ceil(total / Number(limit))
+      }
     });
   } catch (error) {
     next(error);

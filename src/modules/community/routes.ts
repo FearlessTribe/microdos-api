@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { PrismaClient } from '@prisma/client';
 import { requireAuth } from '../../middleware/requireAuth';
 import { AuthService, Permission } from '../../types/permissions';
+import { NotificationService } from './notifications';
 
 const router = Router();
 const prisma = new PrismaClient();
@@ -211,6 +212,26 @@ router.post('/groups/:slug/join', requireAuth, async (req, res, next) => {
       }
     });
 
+    // Send notification to group owner about new member
+    try {
+      if (group.ownerId !== userId) {
+        await NotificationService.createNotification(group.ownerId, {
+          type: 'group_join_request' as any,
+          title: 'Neues Gruppenmitglied',
+          message: `${membership.user.name} ist der Gruppe "${group.name}" beigetreten`,
+          data: {
+            groupId: group.id,
+            memberId: userId,
+            status: membership.status
+          },
+          actionUrl: `/groups/${group.slug}`
+        });
+      }
+    } catch (error) {
+      console.error('Error sending group join notification:', error);
+      // Don't fail the join if notification fails
+    }
+
     res.status(201).json({
       success: true,
       membership
@@ -222,10 +243,11 @@ router.post('/groups/:slug/join', requireAuth, async (req, res, next) => {
 
 // ===== POSTS =====
 
-// Create a new post (simplified version without groups for now)
+// Create a new post
 const createPostSchema = z.object({
   title: z.string().max(200).optional(),
   content: z.string().min(1).max(10000),
+  groupId: z.string().optional(), // Optional group association
   media: z.array(z.object({
     type: z.enum(['image', 'video', 'file']),
     url: z.string(),
@@ -242,46 +264,110 @@ const createPostSchema = z.object({
   scheduledFor: z.string().datetime().optional()
 });
 
-router.post('/posts', async (req, res, next) => {
+router.post('/posts', requireAuth, async (req, res, next) => {
   try {
-    const { title, content } = req.body;
-    const userId = req.headers['x-user-id'] as string;
-    const userName = req.headers['x-user-name'] as string;
-    const userEmail = req.headers['x-user-email'] as string;
+    const userId = req.user?.id;
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        error: 'Authentication required'
+      });
+    }
 
-    if (!content || !content.trim()) {
+    const validatedData = createPostSchema.parse(req.body);
+
+    if (!validatedData.content || !validatedData.content.trim()) {
       return res.status(400).json({
         success: false,
         error: 'Content is required'
       });
     }
 
-    // For now, return a mock created post since we don't have the posts table yet
-    const newPost = {
-      id: Date.now().toString(),
-      title: title?.trim() || null,
-      content: content.trim(),
-      status: 'published', // Add status field
-      author: {
-        id: userId || '1',
-        name: userName || 'Anonymous User',
-        handle: userName?.toLowerCase().replace(/\s+/g, '_') || 'anonymous',
-        image: null
-      },
-      isPinned: false,
-      viewCount: 0,
-      reactionCount: 0,
-      commentCount: 0,
-      createdAt: new Date().toISOString(),
-      _count: {
-        comments: 0,
-        reactions: 0
+    // If groupId is provided, verify the user is a member
+    if (validatedData.groupId) {
+      const membership = await prisma.groupMember.findUnique({
+        where: {
+          groupId_userId: {
+            groupId: validatedData.groupId,
+            userId: userId
+          }
+        }
+      });
+
+      if (!membership || membership.status !== 'active') {
+        return res.status(403).json({
+          success: false,
+          error: 'Not a member of this group'
+        });
       }
-    };
+    }
+
+    // Create the post in the database
+    const newPost = await prisma.post.create({
+      data: {
+        title: validatedData.title?.trim() || null,
+        content: validatedData.content.trim(),
+        groupId: validatedData.groupId || null, // Use a default group or null for general posts
+        authorId: userId,
+        media: validatedData.media || null,
+        ogPreview: validatedData.ogPreview || null,
+        scheduledFor: validatedData.scheduledFor ? new Date(validatedData.scheduledFor) : null,
+        status: validatedData.scheduledFor ? 'scheduled' : 'published',
+        publishedAt: validatedData.scheduledFor ? null : new Date()
+      },
+      include: {
+        author: {
+          select: { id: true, name: true, handle: true, image: true }
+        },
+        group: {
+          select: { id: true, name: true, slug: true }
+        },
+        _count: {
+          select: { comments: true, reactions: true }
+        }
+      }
+    });
+
+    // Send notification to group members if this is a group post
+    if (validatedData.groupId) {
+      try {
+        const groupMembers = await prisma.groupMember.findMany({
+          where: {
+            groupId: validatedData.groupId,
+            status: 'active',
+            userId: { not: userId } // Don't notify the author
+          },
+          select: { userId: true }
+        });
+
+        if (groupMembers.length > 0) {
+          const memberIds = groupMembers.map(member => member.userId);
+          await NotificationService.createBulkNotifications(memberIds, {
+            type: 'post_created' as any,
+            title: 'Neuer Post in der Gruppe',
+            message: `Ein neuer Post wurde in der Gruppe erstellt`,
+            data: {
+              postId: newPost.id,
+              groupId: validatedData.groupId,
+              authorId: userId
+            },
+            actionUrl: `/posts/${newPost.id}`
+          });
+        }
+      } catch (error) {
+        console.error('Error sending group notifications:', error);
+        // Don't fail the post creation if notifications fail
+      }
+    }
 
     res.status(201).json({
       success: true,
-      post: newPost,
+      post: {
+        ...newPost,
+        reactionCount: newPost._count.reactions,
+        commentCount: newPost._count.comments,
+        viewCount: newPost.viewCount
+      },
       message: 'Post erfolgreich erstellt!'
     });
   } catch (error) {
@@ -289,7 +375,7 @@ router.post('/posts', async (req, res, next) => {
   }
 });
 
-// Get posts with sorting (simplified - no groups)
+// Get posts with sorting
 router.get('/posts', async (req, res, next) => {
   try {
     const { 
@@ -297,7 +383,8 @@ router.get('/posts', async (req, res, next) => {
       page = 1, 
       limit = 20,
       cursor,
-      search
+      search,
+      groupId
     } = req.query;
 
     const skip = cursor ? 0 : (Number(page) - 1) * Number(limit);
@@ -320,136 +407,58 @@ router.get('/posts', async (req, res, next) => {
     }
 
     const where: any = {
-      // For mock data, we don't need status filtering
+      status: 'published'
     };
 
     if (cursor) {
       where.id = { lt: cursor };
     }
 
-    // For now, return mock data since we don't have the posts table yet
-    const allMockPosts = [
-      {
-        id: '1',
-        title: 'Meine ersten Erfahrungen mit Mikrodosierung',
-        content: 'Ich habe vor 2 Wochen mit der Mikrodosierung begonnen und bin begeistert von den ersten Ergebnissen. Meine Konzentration hat sich deutlich verbessert und ich fühle mich insgesamt ausgeglichener.',
-        status: 'published',
-        author: {
-          id: '1',
-          name: 'Max Mustermann',
-          handle: 'max_m',
-          image: null
-        },
-        isPinned: false,
-        viewCount: 42,
-        reactionCount: 8,
-        commentCount: 3,
-        createdAt: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString(),
-        _count: {
-          comments: 3,
-          reactions: 8
-        }
-      },
-      {
-        id: '2',
-        title: 'Tipps für Anfänger',
-        content: 'Hier sind meine wichtigsten Tipps für alle, die gerade mit der Mikrodosierung anfangen: 1. Starte niedrig, 2. Führe ein Tagebuch, 3. Sei geduldig mit den Ergebnissen.',
-        author: {
-          id: '2',
-          name: 'Anna Schmidt',
-          handle: 'anna_s',
-          image: null
-        },
-        isPinned: true,
-        viewCount: 156,
-        reactionCount: 23,
-        commentCount: 7,
-        createdAt: new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString(),
-        _count: {
-          comments: 7,
-          reactions: 23
-        }
-      },
-      {
-        id: '3',
-        title: 'Protokoll-Vergleich: Fadiman vs. Stamets',
-        content: 'Ich habe beide Protokolle ausprobiert und möchte meine Erfahrungen teilen. Das Fadiman-Protokoll war für mich als Anfänger besser geeignet, während Stamets für fortgeschrittene Anwender interessant ist.',
-        author: {
-          id: '3',
-          name: 'Dr. Thomas Weber',
-          handle: 'dr_weber',
-          image: null
-        },
-        isPinned: false,
-        viewCount: 89,
-        reactionCount: 15,
-        commentCount: 12,
-        createdAt: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString(),
-        _count: {
-          comments: 12,
-          reactions: 15
-        }
-      },
-      {
-        id: '4',
-        title: 'Dosierung und Timing',
-        content: 'Wann ist der beste Zeitpunkt für die Einnahme? Ich habe verschiedene Zeiten ausprobiert und finde morgens auf nüchternen Magen am besten.',
-        author: {
-          id: '4',
-          name: 'Sarah Müller',
-          handle: 'sarah_m',
-          image: null
-        },
-        isPinned: false,
-        viewCount: 67,
-        reactionCount: 12,
-        commentCount: 5,
-        createdAt: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString(),
-        _count: {
-          comments: 5,
-          reactions: 12
-        }
-      },
-      {
-        id: '5',
-        title: 'Nebenwirkungen und Vorsicht',
-        content: 'Wichtige Hinweise zu möglichen Nebenwirkungen und wann man die Mikrodosierung pausieren sollte.',
-        author: {
-          id: '5',
-          name: 'Dr. Lisa Klein',
-          handle: 'dr_klein',
-          image: null
-        },
-        isPinned: false,
-        viewCount: 203,
-        reactionCount: 31,
-        commentCount: 18,
-        createdAt: new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString(),
-        _count: {
-          comments: 18,
-          reactions: 31
-        }
-      }
-    ];
-
-    // Filter posts based on search query
-    let mockPosts = allMockPosts;
-    if (search && typeof search === 'string') {
-      const searchLower = search.toLowerCase();
-      mockPosts = allMockPosts.filter(post => 
-        post.title?.toLowerCase().includes(searchLower) ||
-        post.content.toLowerCase().includes(searchLower) ||
-        post.author.name.toLowerCase().includes(searchLower)
-      );
+    if (groupId) {
+      where.groupId = groupId;
     }
+
+    if (search && typeof search === 'string') {
+      where.OR = [
+        { title: { contains: search, mode: 'insensitive' } },
+        { content: { contains: search, mode: 'insensitive' } },
+        { author: { name: { contains: search, mode: 'insensitive' } } }
+      ];
+    }
+
+    const posts = await prisma.post.findMany({
+      where,
+      include: {
+        author: {
+          select: { id: true, name: true, handle: true, image: true }
+        },
+        group: {
+          select: { id: true, name: true, slug: true }
+        },
+        _count: {
+          select: { comments: true, reactions: true }
+        }
+      },
+      orderBy,
+      skip,
+      take: Number(limit)
+    });
+
+    const total = await prisma.post.count({ where });
 
     res.json({
       success: true,
-      posts: mockPosts,
+      posts: posts.map(post => ({
+        ...post,
+        reactionCount: post._count.reactions,
+        commentCount: post._count.comments
+      })),
       pagination: {
         page: Number(page),
         limit: Number(limit),
-        hasMore: false
+        total,
+        pages: Math.ceil(total / Number(limit)),
+        hasMore: skip + Number(limit) < total
       }
     });
   } catch (error) {
@@ -459,30 +468,104 @@ router.get('/posts', async (req, res, next) => {
 
 
 // React to post (like/unlike)
-router.post('/posts/:id/reactions', async (req, res, next) => {
+router.post('/posts/:id/reactions', requireAuth, async (req, res, next) => {
   try {
     const { id } = req.params;
-    const userId = req.headers['x-user-id'] as string;
-    const userName = req.headers['x-user-name'] as string;
+    const userId = req.user?.id;
+    const { type = 'like' } = req.body;
 
     if (!userId) {
       return res.status(401).json({
         success: false,
-        error: 'User authentication required'
+        error: 'Authentication required'
       });
     }
 
-    // For now, return mock success since we don't have the reactions table yet
+    // Check if post exists
+    const post = await prisma.post.findUnique({
+      where: { id }
+    });
+
+    if (!post) {
+      return res.status(404).json({
+        success: false,
+        error: 'Post not found'
+      });
+    }
+
+    // Check if reaction already exists
+    const existingReaction = await prisma.reaction.findUnique({
+      where: {
+        targetType_targetId_userId: {
+          targetType: 'post',
+          targetId: id,
+          userId
+        }
+      }
+    });
+
+    if (existingReaction) {
+      // Remove existing reaction
+      await prisma.reaction.delete({
+        where: { id: existingReaction.id }
+      });
+
+      // Update post reaction count
+      await prisma.post.update({
+        where: { id },
+        data: { reactionCount: { decrement: 1 } }
+      });
+
+      return res.json({
+        success: true,
+        message: 'Like erfolgreich entfernt!',
+        action: 'removed',
+        reaction: null
+      });
+    }
+
+    // Create new reaction
+    const reaction = await prisma.reaction.create({
+      data: {
+        targetType: 'post',
+        targetId: id,
+        userId,
+        type
+      }
+    });
+
+    // Update post reaction count
+    await prisma.post.update({
+      where: { id },
+      data: { reactionCount: { increment: 1 } }
+    });
+
+    // Send notification to post author
+    try {
+      const post = await prisma.post.findUnique({
+        where: { id },
+        select: { authorId: true }
+      });
+
+      if (post && post.authorId !== userId) {
+        await NotificationService.sendReactionNotification(
+          post.authorId,
+          userId,
+          'post',
+          id,
+          type
+        );
+      }
+    } catch (error) {
+      console.error('Error sending reaction notification:', error);
+      // Don't fail the reaction if notification fails
+    }
+
     res.json({
       success: true,
       message: 'Post erfolgreich geliked!',
-      reaction: {
-        id: Date.now().toString(),
-        postId: id,
-        userId,
-        type: 'like',
-        createdAt: new Date().toISOString()
-      }
+      action: 'added',
+      reaction
     });
   } catch (error) {
     next(error);
@@ -490,19 +573,46 @@ router.post('/posts/:id/reactions', async (req, res, next) => {
 });
 
 // Remove reaction from post
-router.delete('/posts/:id/reactions', async (req, res, next) => {
+router.delete('/posts/:id/reactions', requireAuth, async (req, res, next) => {
   try {
     const { id } = req.params;
-    const userId = req.headers['x-user-id'] as string;
+    const userId = req.user?.id;
 
     if (!userId) {
       return res.status(401).json({
         success: false,
-        error: 'User authentication required'
+        error: 'Authentication required'
       });
     }
 
-    // For now, return mock success
+    // Find and remove the reaction
+    const reaction = await prisma.reaction.findUnique({
+      where: {
+        targetType_targetId_userId: {
+          targetType: 'post',
+          targetId: id,
+          userId
+        }
+      }
+    });
+
+    if (!reaction) {
+      return res.status(404).json({
+        success: false,
+        error: 'Reaction not found'
+      });
+    }
+
+    await prisma.reaction.delete({
+      where: { id: reaction.id }
+    });
+
+    // Update post reaction count
+    await prisma.post.update({
+      where: { id },
+      data: { reactionCount: { decrement: 1 } }
+    });
+
     res.json({
       success: true,
       message: 'Like erfolgreich entfernt!'
@@ -516,53 +626,75 @@ router.delete('/posts/:id/reactions', async (req, res, next) => {
 router.get('/posts/:id/comments', async (req, res, next) => {
   try {
     const { id } = req.params;
+    const { page = 1, limit = 20 } = req.query;
+    const skip = (Number(page) - 1) * Number(limit);
 
-    // Mock comments for now
-    const mockComments = [
-      {
-        id: '1',
-        content: 'Sehr interessant! Ich habe ähnliche Erfahrungen gemacht.',
-        author: {
-          id: '2',
-          name: 'Anna Schmidt',
-          handle: 'anna_s',
-          image: null
-        },
-        createdAt: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
-        reactionCount: 3,
-        hasReacted: false
+    // Check if post exists
+    const post = await prisma.post.findUnique({
+      where: { id }
+    });
+
+    if (!post) {
+      return res.status(404).json({
+        success: false,
+        error: 'Post not found'
+      });
+    }
+
+    const comments = await prisma.comment.findMany({
+      where: {
+        postId: id,
+        status: 'published',
+        parentId: null // Only top-level comments
       },
-      {
-        id: '2',
-        content: 'Danke für die Tipps! Wann hast du mit der Mikrodosierung angefangen?',
+      include: {
         author: {
-          id: '3',
-          name: 'Dr. Thomas Weber',
-          handle: 'dr_weber',
-          image: null
+          select: { id: true, name: true, handle: true, image: true }
         },
-        createdAt: new Date(Date.now() - 4 * 60 * 60 * 1000).toISOString(),
-        reactionCount: 1,
-        hasReacted: false
+        replies: {
+          include: {
+            author: {
+              select: { id: true, name: true, handle: true, image: true }
+            },
+            _count: {
+              select: { reactions: true }
+            }
+          },
+          orderBy: { createdAt: 'asc' }
+        },
+        _count: {
+          select: { reactions: true }
+        }
       },
-      {
-        id: '3',
-        content: 'Ich kann das bestätigen. Die Konzentration hat sich bei mir auch deutlich verbessert.',
-        author: {
-          id: '4',
-          name: 'Sarah Müller',
-          handle: 'sarah_m',
-          image: null
-        },
-        createdAt: new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString(),
-        reactionCount: 5,
-        hasReacted: false
+      orderBy: { createdAt: 'asc' },
+      skip,
+      take: Number(limit)
+    });
+
+    const total = await prisma.comment.count({
+      where: {
+        postId: id,
+        status: 'published',
+        parentId: null
       }
-    ];
+    });
 
     res.json({
       success: true,
-      comments: mockComments
+      comments: comments.map(comment => ({
+        ...comment,
+        reactionCount: comment._count.reactions,
+        replies: comment.replies.map(reply => ({
+          ...reply,
+          reactionCount: reply._count.reactions
+        }))
+      })),
+      pagination: {
+        page: Number(page),
+        limit: Number(limit),
+        total,
+        pages: Math.ceil(total / Number(limit))
+      }
     });
   } catch (error) {
     next(error);
@@ -570,12 +702,11 @@ router.get('/posts/:id/comments', async (req, res, next) => {
 });
 
 // Create comment for a post
-router.post('/posts/:id/comments', async (req, res, next) => {
+router.post('/posts/:id/comments', requireAuth, async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { content } = req.body;
-    const userId = req.headers['x-user-id'] as string;
-    const userName = req.headers['x-user-name'] as string;
+    const { content, parentId } = req.body;
+    const userId = req.user?.id;
 
     if (!content || !content.trim()) {
       return res.status(400).json({
@@ -587,28 +718,87 @@ router.post('/posts/:id/comments', async (req, res, next) => {
     if (!userId) {
       return res.status(401).json({
         success: false,
-        error: 'User authentication required'
+        error: 'Authentication required'
       });
     }
 
-    // Mock created comment
-    const newComment = {
-      id: Date.now().toString(),
-      content: content.trim(),
-      author: {
-        id: userId,
-        name: userName || 'Anonymous User',
-        handle: userName?.toLowerCase().replace(/\s+/g, '_') || 'anonymous',
-        image: null
+    // Check if post exists
+    const post = await prisma.post.findUnique({
+      where: { id }
+    });
+
+    if (!post) {
+      return res.status(404).json({
+        success: false,
+        error: 'Post not found'
+      });
+    }
+
+    // If parentId is provided, verify it's a valid comment
+    if (parentId) {
+      const parentComment = await prisma.comment.findUnique({
+        where: { id: parentId }
+      });
+
+      if (!parentComment || parentComment.postId !== id) {
+        return res.status(400).json({
+          success: false,
+          error: 'Invalid parent comment'
+        });
+      }
+    }
+
+    // Create the comment
+    const newComment = await prisma.comment.create({
+      data: {
+        postId: id,
+        authorId: userId,
+        content: content.trim(),
+        parentId: parentId || null
       },
-      createdAt: new Date().toISOString(),
-      reactionCount: 0,
-      hasReacted: false
-    };
+      include: {
+        author: {
+          select: { id: true, name: true, handle: true, image: true }
+        },
+        _count: {
+          select: { reactions: true }
+        }
+      }
+    });
+
+    // Update comment count on post
+    await prisma.post.update({
+      where: { id },
+      data: { commentCount: { increment: 1 } }
+    });
+
+    // Send notification to post author
+    try {
+      const post = await prisma.post.findUnique({
+        where: { id },
+        select: { authorId: true }
+      });
+
+      if (post && post.authorId !== userId) {
+        await NotificationService.sendReplyNotification(
+          post.authorId,
+          userId,
+          id,
+          newComment.id,
+          content.trim()
+        );
+      }
+    } catch (error) {
+      console.error('Error sending reply notification:', error);
+      // Don't fail the comment creation if notification fails
+    }
 
     res.status(201).json({
       success: true,
-      comment: newComment,
+      comment: {
+        ...newComment,
+        reactionCount: newComment._count.reactions
+      },
       message: 'Kommentar erfolgreich erstellt!'
     });
   } catch (error) {

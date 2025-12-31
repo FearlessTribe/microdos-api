@@ -3,8 +3,8 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider = "sqlite"
+  url      = "file:./dev.db"
 }
 
 model User {
@@ -261,14 +261,13 @@ model Notification {
   user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   // Notification details
-  type    String // "mention", "reply", "reaction", "post_approved", etc.
+  type    String // "reminder", "reflection", "assessment"
   title   String
   message String
 
   // Scheduling
   scheduledFor DateTime
   sentAt       DateTime?
-  readAt       DateTime? // When the notification was read by the user
 
   // Status
   status String // "scheduled", "sent", "delivered", "failed"
